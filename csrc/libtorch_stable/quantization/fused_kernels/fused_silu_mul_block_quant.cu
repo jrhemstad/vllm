@@ -3,6 +3,7 @@
 
 #include "../../torch_utils.h"
 
+#include "../../cub_helpers.h"
 #include "../../dispatch_utils.h"
 #include "quant_conversions.cuh"
 
@@ -47,8 +48,9 @@ __global__ void silu_and_mul_per_block_quant_kernel(
                                ? scales + group_idx * num_tokens + token_idx
                                : scales + token_idx * num_groups + group_idx;
 
-  // Shared memory for reduction (compile-time sized)
-  __shared__ float shared_max[group_size];
+  using BlockReduce = cub::BlockReduce<float, group_size>;
+  __shared__ typename BlockReduce::TempStorage reduce_storage;
+  __shared__ float shared_scale;
 
   // Step 1: Each thread loads one element, computes SiLU, stores in register
   float gate = static_cast<float>(token_input_gate[tid]);
@@ -60,22 +62,11 @@ __global__ void silu_and_mul_per_block_quant_kernel(
   float result = silu_gate * up;  // Keep in register
 
   // Step 2: Reduce to find group max
-  shared_max[tid] = fabsf(result);
-  __syncthreads();
-
-// Power-of-2 reduction (group_size guaranteed to be power of 2)
-#pragma unroll
-  for (int stride = group_size / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + stride]);
-    }
-    __syncthreads();
-  }
+  float group_max =
+      BlockReduce(reduce_storage).Reduce(fabsf(result), CubMaxOp{});
 
   // Step 3: Compute scale (thread 0), broadcast via shared memory
   if (tid == 0) {
-    float group_max = shared_max[0];
-
     float const quant_range = quant_type_max_v<scalar_out_t>;
     float group_scale = group_max / quant_range;
 
@@ -90,12 +81,11 @@ __global__ void silu_and_mul_per_block_quant_kernel(
     // Store scale to global memory
     *group_scale_ptr = group_scale;
 
-    // Reuse shared_max[0] to broadcast scale
-    shared_max[0] = group_scale;
+    shared_scale = group_scale;
   }
   __syncthreads();
 
-  float group_scale = shared_max[0];
+  float group_scale = shared_scale;
 
   // Step 4: Quantize and write output
   token_output[tid] =
